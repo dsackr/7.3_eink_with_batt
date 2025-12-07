@@ -901,8 +901,15 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
             <p><strong>Battery:</strong> %BAT_PCT%% (%BAT_VOLT% V)</p>
             <p><strong>LED:</strong> <span class="led-status %LEDCLASS%"></span>%LEDSTATUS%</p>
         </div>
-        <p>This display is controlled by the Pi Zero server.<br>
-        Use the Pi Zero web interface to upload images.</p>
+        <div class="info">
+            <p><strong>How to use</strong></p>
+            <ol>
+                <li>Connect your phone or laptop to the same WiFi network as this device.</li>
+                <li>Open the upload page below to send a photo directly from your camera roll.</li>
+                <li>Tap "Display" on any saved item to show it on the e-paper screen.</li>
+            </ol>
+        </div>
+        <a href="/ui" class="btn">Open Upload Page</a>
         <a href="/colortest" class="btn">6-Color Test</a>
         <a href="/clear" class="btn">Clear (White)</a>
         <div class="btn-row">
@@ -942,6 +949,12 @@ const char UI_HTML[] PROGMEM = R"rawliteral(
         <div class="card">
             <p class="muted" id="status">Ready.</p>
             <p class="muted" id="info">Loading status...</p>
+        </div>
+        <div class="card">
+            <h3>Send photos from your phone</h3>
+            <p class="muted">1) Stay on the same WiFi network as the e-paper display.<br>
+            2) Tap "Choose image" to pick a photo or snap a new one with your camera.<br>
+            3) Press "Send to Display" to convert and transmit. Optionally give it a name to keep it on the device.</p>
         </div>
         <div class="card">
             <label for="fileInput">Choose image</label>
