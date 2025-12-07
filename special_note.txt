@@ -1,0 +1,19 @@
+Arduino uno 
+Flash 存储空间：32 KB（其中 0.5 KB 用于引导程序）
+SRAM（静态随机存取存储器）：2 KB
+EEPROM（电可擦可编程只读存储器）：1 KB
+特别说明:
+最大可以显示300*180像素大小的七色图片（占用约26kb 的Flash）。
+如果你想要更换图片，可以按照用户使用手册里的图片处理和取模步骤自行准备图片。
+然后把txt文件里的内容复制到image.c文件中,具体请查阅用户使用手册。
+
+
+
+Arduino uno
+Flash memory: 32 KB (of which 0.5 KB is used for bootloader)
+SRAM (Static Random Access Memory): 2 KB
+EEPROM (Electrically Erasable Programmable Read-Only Memory): 1 KB
+Special Note:
+It can display seven-color pictures with a maximum size of 300*180 pixels (occupies about 26kb of Flash).
+If you want to change the image, you can prepare the image yourself by following the image processing and impression-taking steps in the user manual.
+Then copy the contents of the txt file to the image.c file. Please refer to the user manual for details.
