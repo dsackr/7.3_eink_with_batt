@@ -30,6 +30,9 @@
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <Adafruit_NeoPixel.h>
+#include <FS.h>
+#include <SD.h>
+#include <ctype.h>
 
 // ============== Pin Definitions ==============
 // E-Paper Display (SeenGreat 7.3" wired from Waveshare cable positions)
@@ -43,6 +46,15 @@
 // SparkFun ESP32-C6 WS2812 NeoPixel LED on GPIO23
 #define NEOPIXEL_PIN 23
 Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// SD card (set CS pin for your board, or -1 to use default)
+const int SD_CS_PIN = -1;  // TODO: set correct SD card CS pin if needed
+
+// Battery monitoring (set pin/divider for your hardware)
+const int BAT_ADC_PIN = -1;         // TODO: set ADC pin connected to battery divider
+const float ADC_REF_V = 3.3f;
+const int ADC_MAX = 4095;
+const float BAT_DIVIDER_RATIO = 2.0f;  // Example: divider halves the voltage
 
 // ============== Display Definitions ==============
 #define EPD_WIDTH   800
@@ -98,12 +110,15 @@ Adafruit_NeoPixel pixel(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
+File currentImageFile;
 
 bool isAPMode = false;
 String currentSSID = "";
 String currentIP = "";
 volatile bool displayBusy = false;
 bool ledEnabled = false;  // LED state (false = off)
+bool sdMounted = false;
+String currentImageSaveName = "";
 
 // ============== Function Declarations ==============
 void SPI_Write(unsigned char value);
@@ -122,6 +137,12 @@ void displayAPInfo(void);
 void displayConnectedInfo(void);
 void setupWiFi(void);
 void setupWebServer(void);
+float readBatteryVoltage();
+int batteryPercentFromVoltage(float v);
+String sanitizeFileName(const String &name);
+void handleUiPage(void);
+void handleListImages(void);
+void handleShowImage(void);
 
 // ============== SPI Functions ==============
 void SPI_Write(unsigned char value) {
@@ -687,6 +708,64 @@ void displayConnectedInfo(void) {
     );
 }
 
+// ============== Battery Helpers ==============
+float readBatteryVoltage() {
+    if (BAT_ADC_PIN < 0) {
+        return 0.0f;
+    }
+
+    int raw = analogRead(BAT_ADC_PIN);
+    float vIn = (raw * ADC_REF_V) / ADC_MAX;
+    float vBat = vIn * BAT_DIVIDER_RATIO;
+    return vBat;
+}
+
+int batteryPercentFromVoltage(float v) {
+    if (v <= 0.0f) return 0;
+    if (v >= 4.20f) return 100;
+    if (v <= 3.30f) return 5;
+
+    // Piecewise linear approximation between key voltage points
+    struct Point { float v; int pct; } points[] = {
+        {4.20f, 100},
+        {4.10f, 90},
+        {3.90f, 70},
+        {3.70f, 50},
+        {3.50f, 25},
+        {3.30f, 10},
+    };
+
+    for (size_t i = 0; i + 1 < sizeof(points) / sizeof(points[0]); i++) {
+        if (v <= points[i].v && v >= points[i + 1].v) {
+            float spanV = points[i].v - points[i + 1].v;
+            int spanPct = points[i].pct - points[i + 1].pct;
+            float ratio = (v - points[i + 1].v) / spanV;
+            int pct = points[i + 1].pct + (int)(spanPct * ratio);
+            return constrain(pct, 0, 100);
+        }
+    }
+
+    return constrain((int)((v - 3.30f) * 100), 0, 100);
+}
+
+String sanitizeFileName(const String &name) {
+    String clean = "";
+    for (size_t i = 0; i < name.length(); i++) {
+        char c = name.charAt(i);
+        if (isalnum(c) || c == '_' || c == '-') {
+            clean += c;
+        }
+    }
+
+    if (clean.length() == 0) return clean;
+
+    if (!clean.endsWith(".bin")) {
+        clean += ".bin";
+    }
+
+    return clean;
+}
+
 // ============== WiFi Setup ==============
 void setupWiFi(void) {
     preferences.begin("epaper", false);
@@ -819,6 +898,7 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
             <p><strong>IP Address:</strong> %IP%</p>
             <p><strong>Status:</strong> %STATUS%</p>
             <p><strong>Display:</strong> 800x480, 6-color</p>
+            <p><strong>Battery:</strong> %BAT_PCT%% (%BAT_VOLT% V)</p>
             <p><strong>LED:</strong> <span class="led-status %LEDCLASS%"></span>%LEDSTATUS%</p>
         </div>
         <p>This display is controlled by the Pi Zero server.<br>
@@ -835,6 +915,206 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+const char UI_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>E-Paper Image Upload</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e5e7eb; }
+        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+        h1 { text-align: center; color: #f97316; }
+        .card { background: #111827; padding: 20px; border-radius: 10px; margin-bottom: 16px; box-shadow: 0 4px 10px rgba(0,0,0,0.25); }
+        label { display: block; margin: 10px 0 6px; font-weight: bold; }
+        input[type="file"], input[type="text"] { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #1f2937; background: #0b1220; color: #e5e7eb; }
+        button { padding: 12px 18px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        #status { background: #0b1220; padding: 12px; border-radius: 6px; min-height: 44px; white-space: pre-wrap; }
+        .images { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+        .image-item { background: #0b1220; padding: 12px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; }
+        .muted { color: #9ca3af; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>E-Paper Image Upload</h1>
+        <div class="card">
+            <p class="muted" id="status">Ready.</p>
+            <p class="muted" id="info">Loading status...</p>
+        </div>
+        <div class="card">
+            <label for="fileInput">Choose image</label>
+            <input type="file" id="fileInput" accept="image/*">
+            <label for="imageName">Optional name to save</label>
+            <input type="text" id="imageName" placeholder="Optional name to save">
+            <div style="margin-top: 12px; display: flex; gap: 10px; flex-wrap: wrap;">
+                <button id="sendBtn">Send to Display</button>
+                <button id="refreshBtn" type="button">Refresh Saved List</button>
+            </div>
+        </div>
+        <div class="card">
+            <h3>Saved Images</h3>
+            <div id="savedImages" class="images"></div>
+        </div>
+    </div>
+
+    <script>
+    const statusEl = document.getElementById('status');
+    const infoEl = document.getElementById('info');
+    const savedContainer = document.getElementById('savedImages');
+    const sendBtn = document.getElementById('sendBtn');
+    const refreshBtn = document.getElementById('refreshBtn');
+
+    function logStatus(msg) { statusEl.textContent = msg; }
+    function logInfo(msg) { infoEl.textContent = msg; }
+
+    async function fetchStatus() {
+        try {
+            const res = await fetch('/status');
+            const data = await res.json();
+            logInfo(`SSID: ${data.ssid} | IP: ${data.ip} | Battery: ${data.battery_percent}% (${data.battery_voltage} V)`);
+        } catch (e) {
+            logInfo('Unable to load status');
+        }
+    }
+
+    async function fetchImages() {
+        try {
+            const res = await fetch('/images');
+            const names = await res.json();
+            savedContainer.innerHTML = '';
+            if (!names || names.length === 0) {
+                savedContainer.innerHTML = '<p class="muted">No saved images.</p>';
+                return;
+            }
+            names.forEach(name => {
+                const div = document.createElement('div');
+                div.className = 'image-item';
+                div.innerHTML = `<span>${name}</span>`;
+                const btn = document.createElement('button');
+                btn.textContent = 'Display';
+                btn.onclick = async () => {
+                    logStatus(`Displaying ${name}...`);
+                    const res = await fetch(`/images/show?name=${encodeURIComponent(name)}`, { method: 'POST' });
+                    const data = await res.json();
+                    logStatus(data.message || 'Done');
+                };
+                div.appendChild(btn);
+                savedContainer.appendChild(div);
+            });
+        } catch (e) {
+            savedContainer.innerHTML = '<p class="muted">Unable to load images.</p>';
+        }
+    }
+
+    const palette = [
+        { code: 0x0, r: 0, g: 0, b: 0 },       // Black
+        { code: 0x1, r: 255, g: 255, b: 255 }, // White
+        { code: 0x2, r: 255, g: 255, b: 0 },   // Yellow
+        { code: 0x3, r: 255, g: 0, b: 0 },     // Red
+        { code: 0x5, r: 0, g: 0, b: 255 },     // Blue
+        { code: 0x6, r: 0, g: 128, b: 0 },     // Green
+        { code: 0x7, r: 255, g: 255, b: 255 }, // Clean treated as white
+    ];
+
+    function nearestColor(r, g, b) {
+        let best = palette[0];
+        let bestDist = Number.MAX_VALUE;
+        for (const p of palette) {
+            const dr = r - p.r, dg = g - p.g, db = b - p.b;
+            const dist = dr * dr + dg * dg + db * db;
+            if (dist < bestDist) { bestDist = dist; best = p; }
+        }
+        return best.code;
+    }
+
+    function packImageData(imgData) {
+        const packed = new Uint8Array(800 * 480 / 2);
+        let p = 0;
+        for (let i = 0; i < imgData.data.length; i += 8) {
+            const r1 = imgData.data[i], g1 = imgData.data[i+1], b1 = imgData.data[i+2];
+            const r2 = imgData.data[i+4], g2 = imgData.data[i+5], b2 = imgData.data[i+6];
+            const c1 = nearestColor(r1, g1, b1);
+            const c2 = nearestColor(r2, g2, b2);
+            packed[p++] = (c1 << 4) | c2;
+        }
+        return packed;
+    }
+
+    async function sendToDisplay(bytes, saveName) {
+        const query = saveName ? `?save=${encodeURIComponent(saveName)}` : '';
+        logStatus('Starting upload...');
+        let res = await fetch(`/display/start${query}`, { method: 'POST' });
+        if (!res.ok) { logStatus('Failed to start transfer'); return; }
+
+        const chunkSize = 4096;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+            const chunk = bytes.slice(offset, offset + chunkSize);
+            let hex = '';
+            for (const b of chunk) hex += b.toString(16).padStart(2, '0');
+            res = await fetch('/display/chunk', {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain' },
+                body: hex
+            });
+            if (!res.ok) { logStatus('Chunk upload failed'); return; }
+            logStatus(`Uploading... ${(offset + chunk.length)} / ${bytes.length}`);
+        }
+
+        res = await fetch('/display/end', { method: 'POST' });
+        const data = await res.json();
+        logStatus(data.message || 'Done');
+    }
+
+    function scaleAndConvert(image) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 800; canvas.height = 480;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const scale = Math.min(canvas.width / image.width, canvas.height / image.height);
+        const drawW = image.width * scale;
+        const drawH = image.height * scale;
+        const dx = (canvas.width - drawW) / 2;
+        const dy = (canvas.height - drawH) / 2;
+        ctx.drawImage(image, dx, dy, drawW, drawH);
+
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        return packImageData(imgData);
+    }
+
+    async function handleSend() {
+        const file = document.getElementById('fileInput').files[0];
+        const saveName = document.getElementById('imageName').value.trim();
+        if (!file) { logStatus('Select a file first.'); return; }
+        sendBtn.disabled = true;
+        logStatus('Loading image...');
+        const reader = new FileReader();
+        reader.onload = () => {
+            const img = new Image();
+            img.onload = async () => {
+                const bytes = scaleAndConvert(img);
+                await sendToDisplay(bytes, saveName);
+                sendBtn.disabled = false;
+                if (saveName) fetchImages();
+            };
+            img.onerror = () => { logStatus('Failed to load image.'); sendBtn.disabled = false; };
+            img.src = reader.result;
+        };
+        reader.readAsDataURL(file);
+    }
+
+    sendBtn.onclick = handleSend;
+    refreshBtn.onclick = fetchImages;
+    fetchStatus();
+    fetchImages();
+    </script>
+</body>
+</html>
+)rawliteral";
+
 // ============== Web Server Handlers ==============
 void handleRoot(void) {
     if (isAPMode) {
@@ -846,6 +1126,10 @@ void handleRoot(void) {
         html.replace("%STATUS%", displayBusy ? "Busy (refreshing)" : "Ready");
         html.replace("%LEDCLASS%", ledEnabled ? "led-on" : "led-off");
         html.replace("%LEDSTATUS%", ledEnabled ? "On" : "Off");
+        float vBat = readBatteryVoltage();
+        int pct = batteryPercentFromVoltage(vBat);
+        html.replace("%BAT_VOLT%", String(vBat, 2));
+        html.replace("%BAT_PCT%", String(pct));
         server.send(200, "text/html", html);
     }
 }
@@ -944,6 +1228,9 @@ void handleSingleColor(void) {
 }
 
 void handleStatus(void) {
+    float vBat = readBatteryVoltage();
+    int percent = batteryPercentFromVoltage(vBat);
+
     String json = "{";
     json += "\"busy\":" + String(displayBusy ? "true" : "false") + ",";
     json += "\"ip\":\"" + currentIP + "\",";
@@ -951,9 +1238,109 @@ void handleStatus(void) {
     json += "\"width\":800,";
     json += "\"height\":480,";
     json += "\"colors\":6,";
-    json += "\"led\":" + String(ledEnabled ? "true" : "false");
+    json += "\"led\":" + String(ledEnabled ? "true" : "false") + ",";
+    json += "\"battery_voltage\":" + String(vBat, 2) + ",";
+    json += "\"battery_percent\":" + String(percent);
     json += "}";
     server.send(200, "application/json", json);
+}
+
+void handleUiPage(void) {
+    server.send(200, "text/html", UI_HTML);
+}
+
+void handleListImages(void) {
+    if (!sdMounted) {
+        server.send(200, "application/json", "[]");
+        return;
+    }
+
+    File root = SD.open("/");
+    if (!root || !root.isDirectory()) {
+        server.send(500, "application/json", "{\"error\":\"SD not ready\"}");
+        return;
+    }
+
+    String json = "[";
+    bool first = true;
+    File file = root.openNextFile();
+    while (file) {
+        if (!file.isDirectory()) {
+            String name = file.name();
+            if (name.endsWith(".bin")) {
+                if (name.startsWith("/")) name = name.substring(1);
+                if (!first) json += ",";
+                json += "\"" + name + "\"";
+                first = false;
+            }
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+    json += "]";
+
+    server.send(200, "application/json", json);
+}
+
+void handleShowImage(void) {
+    if (displayBusy) {
+        server.send(503, "application/json", "{\"error\":\"Display busy\"}");
+        return;
+    }
+
+    if (!sdMounted) {
+        server.send(404, "application/json", "{\"error\":\"SD not available\"}");
+        return;
+    }
+
+    String nameArg = server.arg("name");
+    String clean = sanitizeFileName(nameArg);
+    if (clean.length() == 0) {
+        server.send(400, "application/json", "{\"error\":\"Invalid name\"}");
+        return;
+    }
+
+    String path = "/" + clean;
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        server.send(404, "application/json", "{\"error\":\"File not found\"}");
+        return;
+    }
+
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Displaying " + clean + "\"}");
+
+    displayBusy = true;
+    Serial.printf("Displaying saved image: %s\n", clean.c_str());
+    EPD_Init();
+    Epaper_Write_Command(DTM);
+
+    const size_t bufSize = 512;
+    uint8_t buffer[bufSize];
+    size_t total = 0;
+    while (true) {
+        size_t readBytes = f.read(buffer, bufSize);
+        if (readBytes == 0) break;
+        for (size_t i = 0; i < readBytes && total < EPD_BUFFER_SIZE; i++) {
+            Epaper_Write_Data(buffer[i]);
+            total++;
+        }
+        if (total >= EPD_BUFFER_SIZE) break;
+    }
+
+    while (total < EPD_BUFFER_SIZE) {
+        Epaper_Write_Data(White);
+        total++;
+    }
+
+    f.close();
+
+    Epaper_Write_Command(0x12);
+    Epaper_Write_Data(0x00);
+    Epaper_READBUSY();
+    EPD_DeepSleep();
+
+    displayBusy = false;
+    Serial.println("Saved image display complete.");
 }
 
 void handleLedOn(void) {
@@ -1056,15 +1443,34 @@ void handleDisplayImageStart(void) {
         server.send(503, "application/json", "{\"error\":\"Display busy\"}");
         return;
     }
-    
+
     displayBusy = true;
     imageInProgress = true;
     imageDataReceived = 0;
-    
+
+    if (currentImageFile) {
+        currentImageFile.close();
+    }
+
+    currentImageSaveName = "";
+    if (sdMounted && server.hasArg("save")) {
+        String requested = sanitizeFileName(server.arg("save"));
+        if (requested.length() > 0) {
+            currentImageSaveName = requested;
+            String path = "/" + requested;
+            currentImageFile = SD.open(path, FILE_WRITE);
+            if (!currentImageFile) {
+                Serial.println("Failed to open file for writing on SD.");
+            } else {
+                Serial.printf("Saving incoming image to %s\n", path.c_str());
+            }
+        }
+    }
+
     Serial.println("Starting chunked image transfer...");
     EPD_Init();
     Epaper_Write_Command(DTM);
-    
+
     server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Ready for chunks\"}");
 }
 
@@ -1095,8 +1501,11 @@ void handleDisplayImageChunk(void) {
         uint8_t highNibble = hexCharToValue(hexData[i]);
         uint8_t lowNibble = hexCharToValue(hexData[i + 1]);
         uint8_t byte = (highNibble << 4) | lowNibble;
-        
+
         Epaper_Write_Data(byte);
+        if (currentImageFile) {
+            currentImageFile.write(byte);
+        }
         imageDataReceived++;
         bytesWritten++;
     }
@@ -1119,14 +1528,24 @@ void handleDisplayImageEnd(void) {
     // Pad with white if we didn't receive enough data
     while (imageDataReceived < EPD_BUFFER_SIZE) {
         Epaper_Write_Data(0x11);  // White
+        if (currentImageFile) {
+            currentImageFile.write(0x11);
+        }
         imageDataReceived++;
     }
-    
+
     Epaper_Write_Command(0x12);
     Epaper_Write_Data(0x00);
     Epaper_READBUSY();
     EPD_DeepSleep();
-    
+
+    if (currentImageFile) {
+        currentImageFile.close();
+        Serial.printf("Saved image to SD as %s (%d bytes)\n", currentImageSaveName.c_str(), imageDataReceived);
+    }
+
+    currentImageSaveName = "";
+
     imageInProgress = false;
     displayBusy = false;
     
@@ -1142,6 +1561,7 @@ void setupWebServer(void) {
     
     // Display control endpoints (for Pi Zero to call)
     server.on("/status", HTTP_GET, handleStatus);
+    server.on("/ui", HTTP_GET, handleUiPage);
     server.on("/colortest", HTTP_GET, handleColorTest);
     server.on("/pintest", HTTP_GET, handlePinTestPage);
     server.on("/pin", HTTP_GET, handlePinControl);
@@ -1161,6 +1581,10 @@ void setupWebServer(void) {
     server.on("/display/start", HTTP_POST, handleDisplayImageStart);
     server.on("/display/chunk", HTTP_POST, handleDisplayImageChunk);
     server.on("/display/end", HTTP_POST, handleDisplayImageEnd);
+
+    // SD stored images
+    server.on("/images", HTTP_GET, handleListImages);
+    server.on("/images/show", HTTP_POST, handleShowImage);
     
     // Captive portal redirect
     server.onNotFound([]() {
@@ -1178,7 +1602,19 @@ void setup() {
     delay(1000);
     Serial.println("\n\n=== E-Paper Display Receiver (ESP32-C6) ===");
     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-    
+
+    // Initialize SD card early
+    if (SD_CS_PIN >= 0) {
+        sdMounted = SD.begin(SD_CS_PIN);
+    } else {
+        sdMounted = SD.begin();
+    }
+    if (sdMounted) {
+        Serial.println("SD card mounted.");
+    } else {
+        Serial.println("SD card not detected or failed to mount.");
+    }
+
     // Initialize NeoPixel LED and turn it OFF
     pixel.begin();
     pixel.setPixelColor(0, 0);  // Off
@@ -1227,6 +1663,7 @@ void setup() {
     Serial.println("  GET  /pintest             - Pin test page (web UI)");
     Serial.println("  GET  /clear               - Clear to white");
     Serial.println("  GET  /color?color=X       - Fill with color");
+    Serial.println("  GET  /ui                  - Browser upload UI");
     Serial.println("  GET  /led/on              - Turn LED on (dim white)");
     Serial.println("  GET  /led/off             - Turn LED off");
     Serial.println("  GET  /led/toggle          - Toggle LED");
@@ -1234,6 +1671,8 @@ void setup() {
     Serial.println("  POST /display/start       - Start chunked image transfer");
     Serial.println("  POST /display/chunk       - Send image data chunk");
     Serial.println("  POST /display/end         - Finish and refresh display");
+    Serial.println("  GET  /images              - List saved images (SD)");
+    Serial.println("  POST /images/show?name=X  - Display saved image");
 }
 
 void loop() {
