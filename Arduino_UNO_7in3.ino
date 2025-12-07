@@ -1031,7 +1031,7 @@ const char UI_HTML[] PROGMEM = R"rawliteral(
         { code: 0x7, r: 255, g: 255, b: 255 }, // Clean treated as white
     ];
 
-    function nearestColor(r, g, b) {
+    function nearestPaletteColor(r, g, b) {
         let best = palette[0];
         let bestDist = Number.MAX_VALUE;
         for (const p of palette) {
@@ -1039,7 +1039,49 @@ const char UI_HTML[] PROGMEM = R"rawliteral(
             const dist = dr * dr + dg * dg + db * db;
             if (dist < bestDist) { bestDist = dist; best = p; }
         }
-        return best.code;
+        return best;
+    }
+
+    function nearestColor(r, g, b) {
+        return nearestPaletteColor(r, g, b).code;
+    }
+
+    function clamp(val) {
+        return Math.max(0, Math.min(255, val));
+    }
+
+    function applyFloydSteinbergDithering(imgData) {
+        const { data, width, height } = imgData;
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                const oldR = data[idx];
+                const oldG = data[idx + 1];
+                const oldB = data[idx + 2];
+
+                const nearest = nearestPaletteColor(oldR, oldG, oldB);
+                data[idx] = nearest.r;
+                data[idx + 1] = nearest.g;
+                data[idx + 2] = nearest.b;
+
+                const errR = oldR - nearest.r;
+                const errG = oldG - nearest.g;
+                const errB = oldB - nearest.b;
+
+                function scatter(nx, ny, factor) {
+                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) return;
+                    const nIdx = (ny * width + nx) * 4;
+                    data[nIdx] = clamp(data[nIdx] + errR * factor);
+                    data[nIdx + 1] = clamp(data[nIdx + 1] + errG * factor);
+                    data[nIdx + 2] = clamp(data[nIdx + 2] + errB * factor);
+                }
+
+                scatter(x + 1, y, 7 / 16);
+                scatter(x - 1, y + 1, 3 / 16);
+                scatter(x, y + 1, 5 / 16);
+                scatter(x + 1, y + 1, 1 / 16);
+            }
+        }
     }
 
     function packImageData(imgData) {
@@ -1087,14 +1129,30 @@ const char UI_HTML[] PROGMEM = R"rawliteral(
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        const scale = Math.min(canvas.width / image.width, canvas.height / image.height);
-        const drawW = image.width * scale;
-        const drawH = image.height * scale;
-        const dx = (canvas.width - drawW) / 2;
-        const dy = (canvas.height - drawH) / 2;
-        ctx.drawImage(image, dx, dy, drawW, drawH);
+        const portrait = image.height > image.width;
+
+        if (portrait) {
+            ctx.save();
+            ctx.translate(canvas.width / 2, canvas.height / 2);
+            ctx.rotate(-Math.PI / 2);
+            const availableWidth = canvas.height;
+            const availableHeight = canvas.width;
+            const scale = Math.min(availableWidth / image.width, availableHeight / image.height);
+            const drawW = image.width * scale;
+            const drawH = image.height * scale;
+            ctx.drawImage(image, -drawW / 2, -drawH / 2, drawW, drawH);
+            ctx.restore();
+        } else {
+            const scale = Math.min(canvas.width / image.width, canvas.height / image.height);
+            const drawW = image.width * scale;
+            const drawH = image.height * scale;
+            const dx = (canvas.width - drawW) / 2;
+            const dy = (canvas.height - drawH) / 2;
+            ctx.drawImage(image, dx, dy, drawW, drawH);
+        }
 
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        applyFloydSteinbergDithering(imgData);
         return packImageData(imgData);
     }
 
